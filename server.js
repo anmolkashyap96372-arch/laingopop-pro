@@ -1,35 +1,52 @@
-const express=require('express'),fs=require('fs'),path=require('path');
+const express=require('express'),fs=require('fs'),path=require('path'),crypto=require('crypto'),https=require('https'),http=require('http');
 const app=express();app.use(express.json());app.set('trust proxy',true);
+
 const ADMIN_KEY=process.env.ADMIN_KEY||'change-me';
 const FILE=process.env.DATA_FILE||path.join(__dirname,'data.json');
+const VAPID_PUBLIC=process.env.VAPID_PUBLIC||'';
+const VAPID_PRIVATE=process.env.VAPID_PRIVATE||'';
+const VAPID_SUBJECT=process.env.VAPID_SUBJECT||'mailto:admin@laingopop.com';
 const DAYS={yearly:365,monthly:30,week:7};
-let grants=[];try{grants=JSON.parse(fs.readFileSync(FILE,'utf8'))}catch(e){}
-const save=()=>{try{fs.writeFileSync(FILE,JSON.stringify(grants))}catch(e){}};
+
+let db={grants:[],subs:[]};
+try{db=JSON.parse(fs.readFileSync(FILE,'utf8'))}catch(e){}
+if(!db.grants)db.grants=[];if(!db.subs)db.subs=[];
+const save=()=>{try{fs.writeFileSync(FILE,JSON.stringify(db))}catch(e){}};
 const ipOf=r=>(r.headers['x-nf-client-connection-ip']||r.headers['cf-connecting-ip']||(r.headers['x-forwarded-for']||'').split(',')[0]||r.ip||'').trim();
 const norm=s=>String(s||'').trim().toUpperCase();
 const live=g=>g.expiresAt>Date.now();
 const adminOnly=(q,s,n)=>q.headers['x-admin-key']===ADMIN_KEY?n():s.status(401).json({error:'bad key'});
+const b64url=b=>Buffer.from(b).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
 
-// App calls this on open/refresh
+// ── VAPID helpers (no npm dep) ────────────────────────────────────────────────
+function vapidJwt(audience){
+  const header=b64url(JSON.stringify({typ:'JWT',alg:'ES256'}));
+  const payload=b64url(JSON.stringify({aud:audience,exp:Math.floor(Date.now()/1000)+3600,sub:VAPID_SUBJECT}));
+  const unsigned=`${header}.${payload}`;
+  const privDer=Buffer.from(VAPID_PRIVATE,'base64');
+  let privKey;
+  try{
+    // raw 32-byte key -> pkcs8 der
+    const pkcs8=Buffer.concat([Buffer.from('308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b020101042','hex'),privDer,Buffer.from('a144034200','hex'),Buffer.from(VAPID_PUBLIC,'base64')]);
+    privKey=crypto.createPrivateKey({key:pkcs8,format:'der',type:'pkcs8'});
+  }catch(e){privKey=crypto.createPrivateKey({key:Buffer.from(VAPID_PRIVATE,'base64'),format:'der',type:'pkcs8'})}
+  const sig=crypto.sign('sha256',Buffer.from(unsigned),{key:privKey,dsaEncoding:'ieee-p1363'});
+  return `${unsigned}.${b64url(sig)}`;
+}
+function sendPush(sub,payload){
+  return new Promise((ok,fail)=>{
+    if(!VAPID_PUBLIC||!VAPID_PRIVATE)return fail(new Error('No VAPID keys'));
+    const ep=new URL(sub.endpoint);
+    const audience=`${ep.protocol}//${ep.host}`;
+    const jwt=vapidJwt(audience);
+    const auth=`vapid t=${jwt},k=${VAPID_PUBLIC}`;
+    const body=Buffer.from(typeof payload==='string'?payload:JSON.stringify(payload));
+    const opts={hostname:ep.hostname,port:ep.port||443,path:ep.pathname+ep.search,method:'POST',headers:{'Content-Type':'application/octet-stream','Content-Length':body.length,'Authorization':auth,'TTL':'86400'}};
+    const req=(ep.protocol==='https:'?https:http).request(opts,r=>{r.resume();ok(r.statusCode)});
+    req.on('error',fail);req.write(body);req.end();
+  });
+}
+
+// ── Status (app calls on open) ────────────────────────────────────────────────
 app.get('/api/status',(q,s)=>{
   const ref=norm(q.query.ref),ip=ipOf(q);
-  const g=grants.filter(live).filter(x=>(x.ref&&x.ref===ref)||(x.ip&&x.ip===ip)).sort((a,b)=>b.expiresAt-a.expiresAt)[0];
-  s.set('Cache-Control','no-store');
-  s.json(g?{pro:true,plan:g.plan,expiresAt:g.expiresAt}:{pro:false});
-});
-// Panel
-app.get('/admin',(q,s)=>s.sendFile(path.join(__dirname,'public','admin.html')));
-app.get('/api/admin/list',adminOnly,(q,s)=>s.json(grants.slice().reverse()));
-app.get('/api/admin/myip',adminOnly,(q,s)=>s.json({ip:ipOf(q)}));
-app.post('/api/admin/grant',adminOnly,(q,s)=>{
-  const {plan,note}=q.body,ref=norm(q.body.ref),ip=String(q.body.ip||'').trim();
-  const days=Number(q.body.days)||DAYS[plan];
-  if(!days||!DAYS[plan]||(!ref&&!ip))return s.status(400).json({error:'plan + (ref or ip) required'});
-  const old=grants.filter(live).find(x=>(ref&&x.ref===ref)||(ip&&x.ip===ip));
-  const start=old?old.expiresAt:Date.now(); // renew = extend
-  const g={id:Date.now().toString(36),ref,ip,plan,note:note||'',createdAt:Date.now(),expiresAt:start+days*864e5};
-  if(old){old.expiresAt=g.expiresAt;old.plan=plan;if(ref)old.ref=ref;if(ip)old.ip=ip;save();return s.json(old)}
-  grants.push(g);save();s.json(g);
-});
-app.post('/api/admin/revoke',adminOnly,(q,s)=>{const g=grants.find(x=>x.id===q.body.id);if(g)g.expiresAt=0;save();s.json({ok:true})});
-app.listen(process.env.PORT||3000);
